@@ -26,8 +26,8 @@ def rollout(
     end_token = tokenizer.eos_token
     end_token_id = tokenizer.eos_token_id
     pad_token_id = tokenizer.pad_token_id
-    prefix_token_ids = batch.prefix_token_ids
-    bsz = len(batch.prefix) * num_answer_per_question
+    prefix_token_ids = batch.prefix_token_ids          # [num_questions_per_batch, len_question_token_ids]
+    bsz = len(batch.prefix) * num_answer_per_question  # batch_size = num_questions_per_batch * num_answer_per_question
     min_prompt_len = min(len(t) for t in prefix_token_ids)
     max_prompt_len = max(len(t) for t in prefix_token_ids)
     total_len = max_gen_len + max_prompt_len
@@ -38,6 +38,7 @@ def rollout(
         dtype=dtype,
     )
     tokens = torch.full((bsz, total_len), pad_token_id, dtype=torch.long, device=device)
+    # Fills input tokens with question token ids.
     for k, t in enumerate(prefix_token_ids):
         offset = k * num_answer_per_question
         for i in range(num_answer_per_question):
@@ -46,7 +47,7 @@ def rollout(
             )
 
     prev_pos = 0
-    input_text_mask = tokens != pad_token_id
+    input_text_mask = tokens != pad_token_id  # [B, total_len], True is valid.
     assert min_prompt_len < total_len
     is_finished = torch.zeros((bsz,), dtype=torch.bool, device=device)
 
@@ -57,9 +58,9 @@ def rollout(
             end="",
         )
         with torch.autocast(device_type=device.type, dtype=dtype):
-            logits = model.inference(tokens[:, prev_pos:cur_pos], prev_pos)
-        probs = torch.softmax(logits[:, -1], dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+            logits = model.inference(tokens[:, prev_pos:cur_pos], prev_pos)  # [B, cur_pos-prev_pos(1), vocab_size]
+        probs = torch.softmax(logits[:, -1], dim=-1)                         # [B, vocab_size]
+        next_token = torch.multinomial(probs, num_samples=1)                 # [B, 1]
         next_token = next_token.reshape(-1)
         next_token = torch.where(
             input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
@@ -83,6 +84,7 @@ def rollout(
     # prepare the output episodes
     episodes = []
     for i in range(bsz // num_answer_per_question):
+        # For each question, loops over all answers.
         for j in range(num_answer_per_question):
             idx = i * num_answer_per_question + j
             generated_token_ids = tokens_list[idx][len(batch.prefix_token_ids[i]) :]
@@ -148,7 +150,7 @@ def update_policy(
     dtype: torch.dtype,
 ):
     """Update the policy using the GRPO algorithm."""
-    episodes = normalize_rewards_per_group(episodes)
+    episodes = normalize_rewards_per_group(episodes)  # A list of "num_questions_per_batch" Episode.
     # sort episodes by token length for efficient (micro-)batching
     episodes.sort(key=lambda x: len(x.prefix_token_ids) + len(x.generated_token_ids))
     num_micro_batches = math.ceil(len(episodes) / micro_batch_size)
@@ -162,7 +164,7 @@ def update_policy(
             end="",
         )
         j = min(i + micro_batch_size, len(episodes))
-        batch_episodes = episodes[i:j]
+        batch_episodes = episodes[i:j]  # A list of "micro_batch_size" Episode.
         batch_lengths = [
             len(episode.prefix_token_ids) + len(episode.generated_token_ids)
             for episode in batch_episodes
@@ -181,32 +183,32 @@ def update_policy(
             for i, episode in enumerate(batch_episodes)
         ]
         batch_advantages = [episode.reward for episode in batch_episodes]
-        batch_token_ids = torch.tensor(batch_token_ids, device=device, dtype=torch.long)
-        batch_masks = torch.tensor(batch_masks, device=device, dtype=torch.bool)
-        batch_advantages = torch.tensor(
+        batch_token_ids = torch.tensor(batch_token_ids, device=device, dtype=torch.long)  # [micro_batch_size, batch_max_length]
+        batch_masks = torch.tensor(batch_masks, device=device, dtype=torch.bool)          # [micro_batch_size, batch_max_length], 1 is valid.
+        batch_advantages = torch.tensor(                                                  # [micro_batch_size], group normalized rewards.
             batch_advantages, device=device, dtype=torch.float32
         )
 
         with torch.autocast(device_type=device.type, dtype=dtype):
-            input_token_ids = batch_token_ids[:, :-1]
-            target_token_ids = batch_token_ids[:, 1:]
-            target_masks = batch_masks[:, 1:]
-            logits = model.forward(input_token_ids).float()
+            input_token_ids = batch_token_ids[:, :-1]        # [micro_batch_size, batch_max_length-1]
+            target_token_ids = batch_token_ids[:, 1:]        # [micro_batch_size, batch_max_length-1]
+            target_masks = batch_masks[:, 1:]                # [micro_batch_size, batch_max_length-1]
+            logits = model.forward(input_token_ids).float()  # [micro_batch_size, batch_max_length-1, vocab_size]
 
         log_probs = -torch.nn.functional.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             target_token_ids.reshape(-1),
             ignore_index=pad_token_id,
             reduction="none",
-        ).reshape(input_token_ids.shape[0], -1)
+        ).reshape(input_token_ids.shape[0], -1)  # [micro_batch_size, batch_max_length-1]
 
         with torch.no_grad():
             token_entropy = compute_entropy(logits)
             entropy = entropy + (token_entropy * target_masks).sum() / num_target_tokens
 
-        obj = log_probs * batch_advantages[:, None]
+        obj = log_probs * batch_advantages[:, None]  # Computes policy gradient loss using advantages. 
         # per-token objective
-        obj = (obj * target_masks).sum() / num_target_tokens
+        obj = (obj * target_masks).sum() / num_target_tokens  # Sums as a scalar.
         loss = -obj
         loss.backward()
 
